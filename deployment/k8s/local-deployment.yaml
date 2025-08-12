@@ -1,0 +1,540 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mediafusion-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mediafusion
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: mediafusion
+    spec:
+      containers:
+      - name: mediafusion
+        image: mhdzumair/mediafusion:4.3.33
+        ports:
+        - containerPort: 8000
+        resources:
+          requests:
+            memory: "500Mi"
+            cpu: "200m"
+          limits:
+            memory: "800Mi"
+            cpu: "200m"
+        env:
+          - name: MONGO_URI
+            value: "mongodb://mongodb-service:27017/mediafusion"
+          - name: SECRET_KEY
+            valueFrom:
+              secretKeyRef:
+                name: mediafusion-secrets
+                key: SECRET_KEY
+          - name: PREMIUMIZE_OAUTH_CLIENT_ID
+            valueFrom:
+              secretKeyRef:
+                name: mediafusion-secrets
+                key: PREMIUMIZE_OAUTH_CLIENT_ID
+          - name: PREMIUMIZE_OAUTH_CLIENT_SECRET
+            valueFrom:
+              secretKeyRef:
+                name: mediafusion-secrets
+                key: PREMIUMIZE_OAUTH_CLIENT_SECRET
+          - name: PROWLARR_API_KEY
+            valueFrom:
+              secretKeyRef:
+                name: mediafusion-secrets
+                key: PROWLARR_API_KEY
+          - name: HOST_URL
+            value: "https://mediafusion.local"
+          - name: POSTER_HOST_URL
+            value: "https://mediafusion.local"
+          - name: ENABLE_TAMILMV_SEARCH_SCRAPER
+            value: "false"
+          - name: PROWLARR_IMMEDIATE_MAX_PROCESS
+            value: "3"
+          - name: PROWLARR_SEARCH_INTERVAL_HOUR
+            value: "24"
+          - name: IS_SCRAP_FROM_TORRENTIO
+            value: "true"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 60
+          failureThreshold: 5
+          timeoutSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 1200
+          periodSeconds: 5
+          timeoutSeconds: 10
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mongodb-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mongodb
+  template:
+    metadata:
+      labels:
+        app: mongodb
+    spec:
+      containers:
+      - name: mongodb
+        image: mongo
+        ports:
+        - containerPort: 27017
+        volumeMounts:
+        - name: mongo-storage
+          mountPath: /data/db
+      volumes:
+      - name: mongo-storage
+        persistentVolumeClaim:
+          claimName: mongo-pvc
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dramatiq-worker-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dramatiq-worker
+  template:
+    metadata:
+      labels:
+        app: dramatiq-worker
+    spec:
+      containers:
+      - name: dramatiq-worker
+        image: mhdzumair/mediafusion:4.3.33
+        command: ["dramatiq", "api.task", "-p", "1", "-t", "1"]
+        env:
+          - name: HOST_URL
+            value: "https://mediafusion.local"
+          - name: MONGO_URI
+            value: "mongodb://mongodb-service:27017/mediafusion"
+          - name: SECRET_KEY
+            valueFrom:
+              secretKeyRef:
+                name: mediafusion-secrets
+                key: SECRET_KEY
+          - name: PROWLARR_API_KEY
+            valueFrom:
+              secretKeyRef:
+                name: mediafusion-secrets
+                key: PROWLARR_API_KEY
+        resources:
+          requests:
+            memory: "500Mi"
+            cpu: "200m"
+          limits:
+            memory: "1Gi"
+            cpu: "200m"
+
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prowlarr-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prowlarr
+  template:
+    metadata:
+      labels:
+        app: prowlarr
+    spec:
+      securityContext:
+        fsGroup: 1000
+      initContainers:
+      - name: config-setup
+        image: curlimages/curl:latest
+        command: ["/bin/sh", "-c"]
+        args:
+          - >
+            until curl -o /config/init-container.sh https://raw.githubusercontent.com/mhdzumair/MediaFusion/main/deployment/k8s/init-container.sh; do
+              echo "Failed to download script file. Retrying...";
+              sleep 3;
+            done;
+            chmod +x /config/init-container.sh;
+            /config/init-container.sh
+        volumeMounts:
+          - name: config-volume
+            mountPath: /config
+        env:
+          - name: PROWLARR_API_KEY
+            valueFrom:
+              secretKeyRef:
+                name: mediafusion-secrets
+                key: PROWLARR_API_KEY
+          - name: FLARESOLVERR_HOST
+            value: "http://flaresolverr-service:8191/"
+      containers:
+      - name: prowlarr
+        image: ghcr.io/hotio/prowlarr:latest
+        resources:
+          requests:
+            memory: "100Mi"
+            cpu: "100m"
+          limits:
+            memory: "200Mi"
+            cpu: "200m"
+        env:
+          - name: PUID
+            value: "1000"
+          - name: PGID
+            value: "1000"
+          - name: UMASK
+            value: "002"
+          - name: PROWLARR_API_KEY
+            valueFrom:
+              secretKeyRef:
+                name: mediafusion-secrets
+                key: PROWLARR_API_KEY
+        ports:
+          - containerPort: 9696
+        livenessProbe:
+          exec:
+            command:
+              - sh
+              - -c
+              - 'curl -H "X-API-KEY: $PROWLARR_API_KEY" http://localhost:9696/api/v1/health'
+          initialDelaySeconds: 60
+          periodSeconds: 60
+          failureThreshold: 5
+          timeoutSeconds: 10
+        volumeMounts:
+          - name: config-volume
+            mountPath: /config
+      - name: setup-indexers
+        image: apteno/alpine-jq:latest
+        command: ["/bin/sh", "-c"]
+        args:
+          - >
+            until curl -o /config/sidecar-config.sh https://raw.githubusercontent.com/mhdzumair/MediaFusion/main/deployment/k8s/sidecar-config.sh; do
+              echo "Failed to download script file. Retrying...";
+              sleep 3;
+            done;
+            chmod +x /config/sidecar-config.sh;
+            /config/sidecar-config.sh
+        env:
+          - name: PROWLARR_API_KEY
+            valueFrom:
+              secretKeyRef:
+                name: mediafusion-secrets
+                key: PROWLARR_API_KEY
+          - name: FLARESOLVERR_HOST
+            value: "http://flaresolverr-service:8191/"
+        volumeMounts:
+          - name: config-volume
+            mountPath: /config
+      volumes:
+        - name: config-volume
+          emptyDir: {}
+
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:latest
+        ports:
+        - containerPort: 6379
+
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: proxybroker-deployment
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: proxybroker
+  template:
+    metadata:
+      labels:
+        app: proxybroker
+    spec:
+      containers:
+      - name: proxybroker
+        image: bluet/proxybroker2:latest
+        args: ["serve", "--host", "0.0.0.0", "--port", "8888", "--types", "HTTP", "HTTPS", "--lvl", "High", "--min-queue", "5"]
+        ports:
+        - containerPort: 8888
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "100Mi"
+          limits:
+            cpu: "200m"
+            memory: "200Mi"
+
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flaresolverr-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: flaresolverr
+  template:
+    metadata:
+      labels:
+        app: flaresolverr
+    spec:
+      containers:
+      - name: flaresolverr
+        image: ghcr.io/flaresolverr/flaresolverr:latest
+        ports:
+        - containerPort: 8191
+        resources:
+          requests:
+            memory: "200Mi"
+            cpu: "100m"
+          limits:
+            memory: "500Mi"
+            cpu: "200m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8191
+          initialDelaySeconds: 10
+          periodSeconds: 60
+          failureThreshold: 5
+          timeoutSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8191
+          initialDelaySeconds: 30
+          periodSeconds: 5
+          timeoutSeconds: 10
+
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: browserless
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: browserless
+  template:
+    metadata:
+      labels:
+        app: browserless
+    spec:
+      containers:
+      - name: browserless
+        image: ghcr.io/browserless/chromium
+        ports:
+        - containerPort: 3000
+        env:
+        - name: TIMEOUT
+          value: "'-1'"
+        resources:
+          requests:
+            memory: "200Mi"
+            cpu: "100m"
+          limits:
+            memory: "500Mi"
+            cpu: "200m"
+        volumeMounts:
+          - name: temp
+            mountPath: /tmp
+      volumes:
+        - name: temp
+          emptyDir: {}
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: mediafusion-service
+spec:
+  selector:
+    app: mediafusion
+  ports:
+    - protocol: TCP
+      port: 8000
+      targetPort: 8000
+  type: NodePort
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongodb-service
+spec:
+  selector:
+    app: mongodb
+  ports:
+    - protocol: TCP
+      port: 27017
+      targetPort: 27017
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: prowlarr-service
+spec:
+  selector:
+    app: prowlarr
+  ports:
+    - protocol: TCP
+      port: 9696
+      targetPort: 9696
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-service
+spec:
+  selector:
+    app: redis
+  ports:
+    - protocol: TCP
+      port: 6379
+      targetPort: 6379
+
+---
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mongo-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: proxybroker-service
+spec:
+  selector:
+    app: proxybroker
+  ports:
+    - protocol: TCP
+      port: 8888
+      targetPort: 8888
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: flaresolverr-service
+spec:
+  selector:
+    app: flaresolverr
+  ports:
+    - protocol: TCP
+      port: 8191
+      targetPort: 8191
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: browserless
+spec:
+  selector:
+    app: browserless
+  ports:
+    - protocol: TCP
+      port: 3000
+      targetPort: 3000
+
+---
+
+apiVersion: autoscaling/v1
+kind: HorizontalPodAutoscaler
+metadata:
+  name: mediafusion-hpa
+  namespace: default
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: mediafusion-deployment
+  minReplicas: 1
+  maxReplicas: 3
+  targetCPUUtilizationPercentage: 50
+
+---
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mediafusion-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  tls:
+  - hosts:
+    - mediafusion.local
+    secretName: mediafusion-tls
+  rules:
+  - host: mediafusion.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: mediafusion-service
+            port:
+              number: 8000
